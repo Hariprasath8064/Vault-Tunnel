@@ -1,0 +1,5 @@
+<resources>
+    <string name="button">Test Connection</string>
+    <string name="connect">Connect</string>
+    <string name="app_name">My Application</string>
+</resources>
