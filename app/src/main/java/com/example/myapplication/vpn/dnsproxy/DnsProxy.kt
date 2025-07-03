@@ -25,9 +25,12 @@ class DnsProxy(private val service: VPNService) : Thread() {
         "test.com",
         "mydomain.org"
     )
+    private val nxdomainBlockList: List<String> = listOf(
+        "blockeddomain.com",
+        "reddit.com"
+    )
     private val reserved10SeriesIps = mutableSetOf<String>()
     private val domaintodummyIP = mutableMapOf<String, String>()
-    private var dummyIpcounter = 3
 
     private val queryArray = SparseArray<QueryState>()
     private val querytimeoutns = 10_000_000_000L
@@ -157,14 +160,43 @@ fun onDnsRequestReceived(ipHeader: IPHeader, udpHeader: UDPHeader, dnsPacket: Dn
     Log.d("DnsProxy", "Current domainlist: $domainlist")
     val domain = dnsPacket.questions?.get(0)?.domain ?: return
 
+    if (nxdomainBlockList.contains(domain)) {
+        Log.d("DNSproxy", "Blocking domain '$domain' with NXDOMAIN")
+        val responsePacket = createDnsResponseWithNxDomain(dnsPacket)
+
+        val originalSourceIP = ipHeader.sourceIP
+        val originalDestinationIP = ipHeader.destinationIP
+        val originalSourcePort = udpHeader.sourcePort
+
+        ipHeader.sourceIP = originalDestinationIP
+        ipHeader.destinationIP = originalSourceIP
+        ipHeader.protocol = IPHeader.Companion.UDP
+
+        udpHeader.sourcePort = 53
+        udpHeader.destinationPort = originalSourcePort
+
+        val tempBuffer = ByteBuffer.allocate(2048)
+        responsePacket.toBytes(tempBuffer)
+        val dnsSize = tempBuffer.position()
+        val dnsBytes = ByteArray(dnsSize)
+        tempBuffer.flip()
+        tempBuffer.get(dnsBytes)
+
+        udpHeader.totalLength = 8 + dnsBytes.size
+        ipHeader.totalLength = 20 + udpHeader.totalLength
+
+        System.arraycopy(dnsBytes, 0, udpHeader.mData, udpHeader.mOffset + 8, dnsBytes.size)
+
+        CommonMethods.computeUDPChecksum(ipHeader, udpHeader)
+        service.sendUDPPacket(ipHeader, udpHeader)
+        return
+    }
+
     if (domainlist.contains(domain)) {
         Log.d("DOMAIN FOUND","Following packet received . CASE IS DOMAIN FOUND  :")
         prettyPrintUDPPacket(ipHeader, udpHeader, dnsPacket, "onDnsRequestReceived")
         val dummyIp = domaintodummyIP.getOrPut(domain) {
-            var ip: String
-            do {
-                ip = "10.0.0.${dummyIpcounter++}"
-            } while (reserved10SeriesIps.contains(ip))
+            val ip = getDummyIpForDomain(domain)
             Log.d("DNSproxy", "Mapping domain '$domain' to dummy IP '$ip'")
             dummyIptodomain[ip] = domain
             ip
@@ -263,6 +295,7 @@ fun onDnsRequestReceived(ipHeader: IPHeader, udpHeader: UDPHeader, dnsPacket: Dn
             queryArray.remove(queryId.toInt())
         }
     }
+
 }
 
     fun createDnsResponseWithIp(request: DnsPacket, ip: String): DnsPacket {
@@ -304,6 +337,35 @@ fun onDnsRequestReceived(ipHeader: IPHeader, udpHeader: UDPHeader, dnsPacket: Dn
 
         return response
     }
+    private fun createDnsResponseWithNxDomain(request: DnsPacket): DnsPacket {
+        val response = DnsPacket()
+        response.header = request.header?.let { h ->
+            DnsHeader(ByteArray(12), 0).apply {
+                id = h.id
+                flags = DnsFlags().apply {
+                    QR = true
+                    RA = true
+                    RD = h.flags.RD == true
+                    Rcode = 3 // NXDOMAIN
+                }
+                questionCount = 1
+                resourceCount = 0
+                aResourceCount = 0
+                eResourceCount = 0
+            }
+        }
+        response.questions = request.questions?.map { q ->
+            Question().apply {
+                domain = q.domain
+                type = q.type
+                clazz = q.clazz
+            }
+        }?.toTypedArray()
+        response.resources = emptyArray()
+        response.aResources = emptyArray()
+        response.eResources = emptyArray()
+        return response
+    }
 
     fun prettyPrintUDPPacket(
         ipHeader: IPHeader,
@@ -340,4 +402,12 @@ fun onDnsRequestReceived(ipHeader: IPHeader, udpHeader: UDPHeader, dnsPacket: Dn
         }
         Log.d(tag, "----------------------------")
     }
+}
+
+private fun getDummyIpForDomain(domain: String): String {
+    val hash = domain.hashCode()
+    val b = (hash shr 16) and 0xFF
+    val c = (hash shr 8) and 0xFF
+    val d = hash and 0xFF
+    return "10.$b.$c.$d"
 }
